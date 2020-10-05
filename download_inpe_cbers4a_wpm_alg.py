@@ -13,7 +13,8 @@ Dependences:
 - mod_py
 
 Updates:
-- None
+- 2020-10-05:
+Added Canceled
 
  ***************************************************************************/
 
@@ -32,7 +33,11 @@ __copyright__ = '(C) 2020, Luiz Motta'
 __revision__ = '$Format:%H$'
  
 import sys, os, shutil
-import urllib.request, urllib.error
+
+import contextlib
+from urllib.request import urlopen 
+from urllib.error import URLError
+
 from multiprocessing.pool import ThreadPool
 
 from osgeo import gdal
@@ -41,6 +46,7 @@ gdal.UseExceptions()
 
 from qgis import processing
 from qgis.processing import alg
+
 
 class FilePathType(object):
     def __init__(self):
@@ -59,14 +65,8 @@ class DownloadCbersWpm():
         self.pathfile, self.pathdir = pathfile, pathdir
         self.feedback = feedback
         self.c_url, self.t_url, self.f_perc_url = 0, 0, 0
-        
-    def _progress(self, name):
-        self.c_url += 1
-        percent = int( self.c_url * self.f_perc_url )
-        msg = f"Download {name} ({self.c_url} of {self.t_url})..."
-        self.feedback.setProgress( percent )
-        self.feedback.setProgressText( msg )
-        
+        self.isOkDownload = True
+       
     def readUrls(self):
         with open( self.pathfile, 'r') as content_file:
             content = content_file.read()    
@@ -78,41 +78,83 @@ class DownloadCbersWpm():
         
     def downloadsImages(self, urls):
         def download(url):
-            # url: http://www2.dgi.inpe.br/api/download/TIFF/CBERS4A/2020_09/CBERS_4A_WPM_RAW_2020_09_16.14_13_00_ETC2/218_128_0/4_BC_UTM_WGS84/CBERS_4A_WPM_20200916_218_128_L4_BAND0.tif?key=motta.luiz@gmail.com&collection=CBERS4A_WPM_L4_DN&scene_id=CBERS4A_WPM21812820200916
+            def urlretrieve(url, filename, isCanceled):
+                """
+                Adaptation from '/usr/lib/python3.8/urllib/request.py'
+                """
+                try:
+                    response = urlopen( url )
+                except URLError as e: # urllib
+                    msg = f"Url '{url}': n{e.reason}"
+                    return { 'isOk': False, 'message': msg}
+
+                size = -1
+                read = 0
+                bs = 1024*8
+                with contextlib.closing( response ) as fp:
+                    headers = fp.info()
+                    if "content-length" in headers:
+                        size = int(headers["Content-Length"])
+
+                    tfp = open(filename, 'wb')
+                    with tfp:
+                        while True:
+                            if isCanceled():
+                                return { 'isOk': False, 'message': 'Canceled' }
+                            block = fp.read( bs )
+                            if not block:
+                                break
+                            read += len(block)
+                            tfp.write( block )
+
+                if size >= 0 and read < size:
+                    msg = f"Retrieval incomplete: got only {read} out of {size} bytes"
+                    return { 'isOk': False, 'message': msg }
+                
+                return { 'isOk': True }
+            
+            def progress(name):
+                self.c_url += 1
+                percent = int( self.c_url * self.f_perc_url )
+                msg = f"Download {name} ({self.c_url} of {self.t_url})..."
+                self.feedback.setProgress( percent )
+                self.feedback.setProgressText( msg )
+
             ds = None
             name = f"{url.split('?')[0].split('/')[-1]}"
             image = f"{self.pathdir}{os.path.sep}{name}"
             image_download = f"{image}.download"
-            try:
-                if not os.path.exists( image ):
-                    _response = urllib.request.urlopen(url, timeout=5) # Check if can access
-                    urllib.request.urlretrieve( url, image_download )
-                    shutil.move( image_download, image )
-                if image.split('.')[-1] == 'tif':
-                    ds = gdal.Open( image, GA_ReadOnly )
-            except urllib.error.URLError as e: # urllib
-                msg = f"Url '{url}': n{e.reason}"
-                self.feedback.reportError( msg )
-                return False
-            except RuntimeError: # gdal
-                os.remove( image )
-                msg = f"Url '{url}': Error open image"
-                self.feedback.reportError( msg )
-                return False
+            if not os.path.exists( image ):
+                r = urlretrieve( url, image_download, self.feedback.isCanceled )
+                if not r['isOk']:
+                    msg = f"{r['message']}. {name}"
+                    self.feedback.reportError( msg )
+                    self.isOkDownload = False
+                    if os.path.isfile( image_download ):
+                        os.remove( image_download )
+                    return
 
-            self._progress( name )
-            ds = None
-            return True
-            
+                shutil.move( image_download, image )
+                if image.split('.')[-1] == 'tif':
+                    try:
+                        ds = gdal.Open( image, GA_ReadOnly )
+                    except RuntimeError: # gdal
+                        os.remove( image )
+                        msg = f"Url for '{name}': Error open image"
+                        self.feedback.reportError( msg )
+                        self.isOkDownload = False
+                        return
+                    ds = None
+                    
+            progress( name )
+
         self.t_url = len( urls )
         self.f_perc_url = 100.0 / self.t_url
         
-        pool = ThreadPool(processes=4)
+        pool = ThreadPool( processes=4 )
         mapResult = pool.map_async( download, urls )
-        results = [ r for r in mapResult.get() ]
+        [ r for r in mapResult.get() ]
         pool.close()
-        
-        return not False in results
 
 @alg(name='cbers4downloadwpmalg', label='Download CBERS WPM files from INPE',
      group='lmottacripts', group_label='Lmotta scripts')
@@ -138,6 +180,7 @@ def cbers4downloadwpmalg(instance, parameters, context, feedback, inputs):
         self.feedback.reportError( msg )
         return { 'MESSAGE': msg }
 
-    isOk = dcw.downloadsImages( urls )
-    msg = f"Finished all {dcw.t_url} files in '{input_pathdir}'" if isOk else 'Error download files'
+    dcw.downloadsImages( urls )
+    msg = f"Finished all {dcw.t_url} files in '{input_pathdir}'" if dcw.isOkDownload else 'Error download files'
+    
     return { 'MESSAGE': msg }
